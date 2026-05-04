@@ -223,6 +223,11 @@ class Wav2Vec2Aligner:
                 chunk_idx += 1
                 continue
 
+            # Per-frame token assignments (includes blanks). Used to find
+            # silence-run boundaries around each word for cut-friendly timing.
+            aligned_tokens_arr = aligned_tokens[0].cpu()  # shape (T_emission,)
+            n_emission_frames = int(aligned_tokens_arr.shape[0])
+
             # Re-group token_spans into per-word lists using char counts.
             cursor = 0
             for n_chars, words_idx, word_text in word_char_counts:
@@ -233,11 +238,50 @@ class Wav2Vec2Aligner:
                     continue
                 start_frame = spans_for_word[0].start
                 end_frame = spans_for_word[-1].end
+
+                # ── Acoustic onset/offset (Fix 3 / NP-SBV2) ─────────────────
+                # The model's `start_frame` is when wav2vec2 was most CONFIDENT
+                # about the first char (typically mid-phoneme). The actual
+                # phoneme ONSET is in the CTC-blank run immediately before, where
+                # the model was building confidence. Walking backward through
+                # contiguous blank frames gives us the silence-run boundary —
+                # the ideal place to CUT for clean audio without slicing
+                # mid-phoneme.
+                #
+                # Same logic forward for the offset end.
+                onset_frame = start_frame
+                while (
+                    onset_frame > 0
+                    and int(aligned_tokens_arr[onset_frame - 1]) == BLANK_IDX
+                ):
+                    onset_frame -= 1
+                # onset_frame now == start_frame (no preceding blanks) OR
+                # the first frame of the contiguous blank run before this word
+                # (which is the frame right after the previous non-blank).
+
+                offset_frame = end_frame
+                while (
+                    offset_frame < n_emission_frames - 1
+                    and int(aligned_tokens_arr[offset_frame + 1]) == BLANK_IDX
+                ):
+                    offset_frame += 1
+                # offset_frame now == end_frame (no trailing blanks) OR the
+                # last frame of the contiguous blank run after this word.
+
                 abs_start = chunk_start_sec + start_frame * sec_per_frame
                 abs_end = chunk_start_sec + end_frame * sec_per_frame
+                abs_onset = chunk_start_sec + onset_frame * sec_per_frame
+                # +1 because end_frame/offset_frame is inclusive
+                abs_offset = chunk_start_sec + (offset_frame + 1) * sec_per_frame
+
                 new_word = dict(words[words_idx])
                 new_word["start"] = float(abs_start)
                 new_word["end"] = float(abs_end)
+                # Acoustic onset/offset — boundaries of the silence-run around
+                # the word. Render-side can cut anywhere in [onset_start, start]
+                # or [end, offset_end] without slicing mid-phoneme.
+                new_word["onset_start"] = float(abs_onset)
+                new_word["offset_end"] = float(abs_offset)
                 aligned[words_idx] = new_word
                 words_aligned += 1
 
