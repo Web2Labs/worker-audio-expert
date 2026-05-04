@@ -18,6 +18,7 @@ from runpod.serverless.utils import rp_cuda
 from faster_whisper import WhisperModel
 from faster_whisper.utils import format_timestamp
 from clap_scorer import ClapScorer
+from aligner import Wav2Vec2Aligner
 
 # Define available models (for validation)
 AVAILABLE_MODELS = {
@@ -45,6 +46,7 @@ class Predictor:
             threading.Lock()
         )  # Lock for thread-safe model loading/unloading
         self.clap_scorer = ClapScorer()
+        self.aligner = Wav2Vec2Aligner()  # lazy-loaded on first force_align call
 
     def setup(self):
         """No models are pre-loaded. Setup is minimal."""
@@ -73,6 +75,7 @@ class Predictor:
         enable_vad=False,
         word_timestamps=False,
         clap_queries=None,
+        force_align=False,
     ):
         """
         Run a single prediction on the model, loading/unloading models as needed.
@@ -203,6 +206,23 @@ class Predictor:
                     }
                     word_timestamps_list.append(word_entry)
             results["word_timestamps"] = word_timestamps_list
+
+            # Wav2vec2 forced alignment — re-times each word against actual audio
+            # (sub-50ms accuracy vs Whisper's 100-300ms cross-attention timing).
+            # Only runs if explicitly requested via force_align: true input.
+            if force_align and word_timestamps_list:
+                print(
+                    f"[Predictor] Running wav2vec2 forced alignment on "
+                    f"{len(word_timestamps_list)} words..."
+                )
+                device = "cuda" if rp_cuda.is_available() else "cpu"
+                self.aligner.setup(device=device)
+                aligned_list = self.aligner.align(str(audio), word_timestamps_list)
+                # Replace the original timestamps with the aligned ones.
+                # The original (cross-attention) timing is gone — if you want both,
+                # this is where to add a `word_timestamps_original` field.
+                results["word_timestamps"] = aligned_list
+                results["word_timestamps_aligned"] = True  # flag so callers know
 
         # CLAP audio-text similarity scoring (optional — only if queries provided)
         if clap_queries and isinstance(clap_queries, dict) and len(clap_queries) > 0:

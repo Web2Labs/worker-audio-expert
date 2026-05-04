@@ -31,10 +31,11 @@ RUN apt-get update -y && \
     apt-get clean -y && \
     rm -rf /var/lib/apt/lists/*
 
-# Install PyTorch with CUDA (needed for CLAP GPU scoring).
-# No torchaudio — not used anywhere.
+# Install PyTorch with CUDA (needed for CLAP GPU scoring + wav2vec2 forced alignment).
+# torchaudio is now required — used by aligner.py for the WAV2VEC2_ASR_LARGE_LV60K_960H
+# pipeline that re-times Whisper word_timestamps with sub-50ms accuracy.
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu124
+    pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu124
 
 # Install Python dependencies
 COPY builder/requirements.txt /requirements.txt

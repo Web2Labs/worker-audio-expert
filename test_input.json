@@ -1,10 +1,11 @@
 {
   "input": {
     "audio": "https://github.com/runpod-workers/sample-inputs/raw/main/audio/gettysburg.wav",
-    "model": "turbo",
+    "model": "large-v3",
     "transcription": "plain_text",
     "translate": false,
     "word_timestamps": true,
+    "force_align": true,
     "temperature": 0,
     "best_of": 5,
     "beam_size": 5,
@@ -14,6 +15,6 @@
     "compression_ratio_threshold": 2.4,
     "logprob_threshold": -1,
     "no_speech_threshold": 0.6,
-    "enable_vad": true
+    "enable_vad": false
   }
 }

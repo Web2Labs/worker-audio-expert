@@ -98,10 +98,39 @@ def run_whisper_job(job):
             enable_vad=job_input["enable_vad"],
             word_timestamps=job_input["word_timestamps"],
             clap_queries=job_input.get("clap_queries"),
+            force_align=job_input.get("force_align", False),
         )
 
     with rp_debugger.LineTimer('cleanup_step'):
         rp_cleanup.clean(['input_objects'])
+
+    # If TEST_OUTPUT_PATH is set (local Docker test mode), dump the full result
+    # as JSON to that path so we can inspect all word timestamps without hitting
+    # the docker stdout buffer limit on long audio.
+    import os
+    import json
+    output_path = os.environ.get("TEST_OUTPUT_PATH")
+    if output_path:
+        # Convert numpy types to plain Python so json.dumps doesn't choke
+        import numpy as np
+        def to_jsonable(o):
+            if isinstance(o, dict):
+                return {k: to_jsonable(v) for k, v in o.items()}
+            if isinstance(o, list):
+                return [to_jsonable(x) for x in o]
+            if isinstance(o, np.floating):
+                return float(o)
+            if isinstance(o, np.integer):
+                return int(o)
+            if isinstance(o, np.ndarray):
+                return to_jsonable(o.tolist())
+            return o
+        try:
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(to_jsonable(whisper_results), f)
+            print(f"[Test] Full result written to {output_path}", flush=True)
+        except Exception as e:
+            print(f"[Test] Failed to write {output_path}: {e}", flush=True)
 
     return whisper_results
 

@@ -159,3 +159,9 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 runpod.toml
+
+# Local Docker test artifacts (NP-SBV1 wav2vec2 alignment work)
+# real-test-input.json contains base64-encoded audio for testing — can be GBs.
+# test-outputs/ holds JSON dumps from TEST_OUTPUT_PATH-mode runs.
+real-test-input.json
+test-outputs/

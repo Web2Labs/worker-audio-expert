@@ -5,3 +5,7 @@ faster-whisper==1.2.1
 # CLAP audio-text similarity scoring
 transformers>=4.40.0
 librosa>=0.10.0
+
+# Wav2vec2 forced alignment for sub-50ms word-level timestamps
+# (torch is installed via the cu124 wheel in the Dockerfile)
+torchaudio
