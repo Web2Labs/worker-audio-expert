@@ -34,8 +34,18 @@ RUN apt-get update -y && \
 # Install PyTorch with CUDA (needed for CLAP GPU scoring + wav2vec2 forced alignment).
 # torchaudio is now required — used by aligner.py for the WAV2VEC2_ASR_LARGE_LV60K_960H
 # pipeline that re-times Whisper word_timestamps with sub-50ms accuracy.
+#
+# 2026-05-23: pinned to torch==2.7.1 / torchaudio==2.7.1 on cu128 wheels.
+# Unpinned cu124 worked through ~2026-05-21, then RunPod silently started
+# routing "AMPERE_24" jobs to NVIDIA RTX PRO 6000 Blackwell MIG slices
+# (sm_120, 2025 architecture). The cu124 wheel does not ship compiled
+# torchaudio kernels for sm_120 → "no kernel image is available for execution
+# on the device" inside torchaudio.pipelines._wav2vec2.utils.layer_norm (CUDA
+# kernel runtime mismatch). cu128 wheels (2.7.1+) ship sm_120 kernels and
+# retain sm_86/sm_89/sm_90 → covers every GPU RunPod might assign.
+# See web2labs/docs/project/relaunch/sessions/ for the diagnosis.
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+    pip install --no-cache-dir torch==2.7.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
 
 # Install Python dependencies
 COPY builder/requirements.txt /requirements.txt
