@@ -20,6 +20,27 @@ from faster_whisper.utils import format_timestamp
 from clap_scorer import ClapScorer
 from aligner import Wav2Vec2Aligner
 
+def parse_suppress_tokens(raw):
+    """
+    Parse the `suppress_tokens` input into the list of ints faster-whisper
+    expects. Accepts the documented comma-separated string form ("-1" or
+    "-1,0,50257"), a ready-made list, or None. Falls back to [-1] (whisper's
+    "default non-speech suppression set" sentinel) on anything unparseable —
+    matching the worker's historical behavior, which hardcoded [-1].
+    """
+    if raw is None:
+        return [-1]
+    if isinstance(raw, (list, tuple)):
+        try:
+            return [int(t) for t in raw]
+        except (TypeError, ValueError):
+            return [-1]
+    try:
+        return [int(t.strip()) for t in str(raw).split(",") if t.strip() != ""]
+    except ValueError:
+        return [-1]
+
+
 # Define available models (for validation)
 AVAILABLE_MODELS = {
     "tiny",
@@ -64,7 +85,10 @@ class Predictor:
         best_of=5,
         beam_size=5,
         patience=1,
-        length_penalty=None,
+        # 1.0 = ctranslate2's neutral default. None crashes ctranslate2's
+        # generate() with a TypeError — the handler always passes the schema
+        # default so production never hit it, but direct callers did.
+        length_penalty=1.0,
         suppress_tokens="-1",
         initial_prompt=None,
         condition_on_previous_text=True,
@@ -143,32 +167,30 @@ class Predictor:
         # Note: FasterWhisper's transcribe might release the GIL, potentially allowing
         # other threads to acquire the model_lock if transcribe is lengthy.
         # If issues arise, the lock might need to encompass the transcribe call too.
-        segments, info = list(
-            model.transcribe(
-                str(audio),
-                language=language,
-                task="transcribe",
-                beam_size=beam_size,
-                best_of=best_of,
-                patience=patience,
-                length_penalty=length_penalty,
-                temperature=temperature,
-                compression_ratio_threshold=compression_ratio_threshold,
-                log_prob_threshold=logprob_threshold,
-                no_speech_threshold=no_speech_threshold,
-                condition_on_previous_text=condition_on_previous_text,
-                initial_prompt=initial_prompt,
-                prefix=None,
-                suppress_blank=True,
-                suppress_tokens=[-1],  # Might need conversion from string
-                without_timestamps=False,
-                max_initial_timestamp=1.0,
-                word_timestamps=word_timestamps,
-                vad_filter=enable_vad,
-            )
+        segments_generator, info = model.transcribe(
+            str(audio),
+            language=language,
+            task="transcribe",
+            beam_size=beam_size,
+            best_of=best_of,
+            patience=patience,
+            length_penalty=length_penalty,
+            temperature=temperature,
+            compression_ratio_threshold=compression_ratio_threshold,
+            log_prob_threshold=logprob_threshold,
+            no_speech_threshold=no_speech_threshold,
+            condition_on_previous_text=condition_on_previous_text,
+            initial_prompt=initial_prompt,
+            prefix=None,
+            suppress_blank=True,
+            suppress_tokens=parse_suppress_tokens(suppress_tokens),
+            without_timestamps=False,
+            max_initial_timestamp=1.0,
+            word_timestamps=word_timestamps,
+            vad_filter=enable_vad,
         )
 
-        segments = list(segments)
+        segments = list(segments_generator)
 
         # Format transcription
         transcription_output = format_segments(transcription, segments)
@@ -197,7 +219,9 @@ class Predictor:
         if word_timestamps:
             word_timestamps_list = []
             for segment in segments:
-                for word in segment.words:
+                # segment.words can be None for a no-speech segment depending on
+                # the faster-whisper version — guard instead of crashing the job.
+                for word in (segment.words or []):
                     word_entry = {
                         "word": word.word,
                         "start": word.start,

@@ -2,10 +2,16 @@ runpod~=1.8.2
 
 faster-whisper==1.2.1
 
-# CLAP audio-text similarity scoring
-transformers>=4.40.0
-librosa>=0.10.0
+# CLAP audio-text similarity scoring.
+# transformers is capped below the next major: 5.x reworks/removes model APIs
+# and an unpinned image rebuild must never silently change CLAP scoring
+# behavior (the register baselines + autozoom thresholds depend on it).
+transformers>=4.40.0,<5
+librosa>=0.10.0,<1
 
-# Wav2vec2 forced alignment for sub-50ms word-level timestamps
-# (torch is installed via the cu124 wheel in the Dockerfile)
+# Wav2vec2 forced alignment for sub-50ms word-level timestamps.
+# torch + torchaudio are pinned to 2.7.1/cu128 in the Dockerfile (Blackwell
+# sm_120 kernels) — this bare entry only asserts torchaudio's presence and
+# must NOT carry a version, or pip would reinstall a different wheel over
+# the CUDA-matched one.
 torchaudio

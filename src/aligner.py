@@ -44,6 +44,11 @@ from torchaudio.pipelines import WAV2VEC2_ASR_LARGE_LV60K_960H as BUNDLE
 # Blank is at index 0 in this model's vocab.
 BLANK_IDX = 0
 
+# Words closer than this to a chunk's audio edge are left for a neighboring
+# chunk (or keep original timing at the very start/end of the file). Absorbs
+# Whisper's own 100-300ms timing error in the selection windows.
+EDGE_MARGIN_SEC = 0.5
+
 
 class Wav2Vec2Aligner:
     """Forced alignment via wav2vec2 CTC. Lazy-loaded on first call."""
@@ -97,6 +102,18 @@ class Wav2Vec2Aligner:
 
         chunk_sec: how much audio to process at once (frames in memory).
         overlap_sec: chunk overlap so words near chunk seams have full context.
+
+        Word→chunk assignment: every word STARTING in a chunk's window is part
+        of that chunk's CTC target sequence (so all speech in the chunk's audio
+        has tokens to map onto), but a word's timing is WRITTEN by exactly one
+        chunk — the first chunk that fully contains it with EDGE_MARGIN_SEC to
+        spare (the last chunk, having no successor, writes everything it
+        contains). Words already written act as anchors only; re-aligning them
+        at the LEFT EDGE of the next chunk (where preceding audio is truncated)
+        measurably degrades their timing, and that degraded version used to
+        overwrite the good mid-chunk one. Words too close to a chunk's RIGHT
+        edge anchor there and are written by the next chunk, which contains
+        them mid-chunk thanks to the overlap.
         """
         if not words:
             return words
@@ -132,27 +149,33 @@ class Wav2Vec2Aligner:
             chunk_dur = chunk_end_sec - chunk_start_sec
             if chunk_dur < 1.0:
                 break  # Skip tiny tail chunks
+            is_last_chunk = chunk_end_sec >= total_dur - 1e-6
 
-            sample_start = int(chunk_start_sec * self.sample_rate)
-            sample_end = int(chunk_end_sec * self.sample_rate)
-            chunk_audio = waveform[:, sample_start:sample_end].to(self.device)
-
-            # Forward pass — get CTC emissions
-            with torch.inference_mode():
-                emissions, _ = self.model(chunk_audio)
-            emissions = torch.log_softmax(emissions, dim=-1)
-            emission = emissions[0]  # (T, vocab)
-            sec_per_frame = chunk_dur / emission.shape[0]
-
-            # Find words in this chunk (by faster-whisper start time).
-            # Use a generous window: include words whose start falls in [chunk_start, chunk_end - 0.5]
-            # so we have enough audio context for the word's end.
+            # Every word STARTING in this chunk's window goes into the CTC
+            # target sequence — INCLUDING words already written by the previous
+            # chunk. The overlap audio contains their speech; without their
+            # tokens as anchors, forced_align smears the first unwritten word's
+            # start across that target-less speech (observed: a word at 59.3s
+            # dragged to the 55.0s chunk boundary). Anchors are aligned but
+            # their timings are discarded — only `writable` words get written.
             words_in_chunk = [
                 (i, w) for i, w in enumerate(words)
-                if chunk_start_sec <= w["start"] < chunk_end_sec - 0.5
+                if chunk_start_sec <= w["start"] < chunk_end_sec - EDGE_MARGIN_SEC
             ]
 
-            if not words_in_chunk:
+            # A word's timing is written by the FIRST chunk that fully contains
+            # it (end inside the margin too; the last chunk has no successor,
+            # so it writes everything it contains). Words at the right edge
+            # anchor here and are written by the next chunk, where the overlap
+            # places them mid-chunk with full acoustic context instead of
+            # force-squeezing their tokens into truncated audio.
+            writable = {
+                i for i, w in words_in_chunk
+                if aligned[i] is None
+                and (is_last_chunk or w["end"] <= chunk_end_sec - EDGE_MARGIN_SEC)
+            }
+
+            if not writable:
                 chunk_start_sec += chunk_step
                 chunk_idx += 1
                 continue
@@ -165,25 +188,38 @@ class Wav2Vec2Aligner:
             word_char_counts: List[Tuple[int, int, str]] = []  # (n_chars, words_idx, original_text)
             for words_idx, w in words_in_chunk:
                 clean = self.normalize_word(w["word"])
-                if not clean:
-                    words_unalignable += 1
-                    aligned[words_idx] = w
-                    continue
                 n_chars_added = 0
-                for ch in clean:
-                    if ch in self.label_to_idx:
-                        tokens.append(self.label_to_idx[ch])
-                        n_chars_added += 1
+                if clean:
+                    for ch in clean:
+                        if ch in self.label_to_idx:
+                            tokens.append(self.label_to_idx[ch])
+                            n_chars_added += 1
                 if n_chars_added == 0:
-                    words_unalignable += 1
-                    aligned[words_idx] = w
+                    # No CTC-representable chars (numbers, symbols). Keeps its
+                    # original whisper timing; contributes nothing as an anchor.
+                    if aligned[words_idx] is None:
+                        words_unalignable += 1
+                        aligned[words_idx] = w
+                    writable.discard(words_idx)
                     continue
                 word_char_counts.append((n_chars_added, words_idx, w["word"]))
 
-            if not word_char_counts:
+            if not writable or not word_char_counts:
                 chunk_start_sec += chunk_step
                 chunk_idx += 1
                 continue
+
+            # Forward pass — get CTC emissions. Done AFTER the word selection so
+            # chunks with nothing to align (silence, music) skip the GPU work.
+            sample_start = int(chunk_start_sec * self.sample_rate)
+            sample_end = int(chunk_end_sec * self.sample_rate)
+            chunk_audio = waveform[:, sample_start:sample_end].to(self.device)
+
+            with torch.inference_mode():
+                emissions, _ = self.model(chunk_audio)
+            emissions = torch.log_softmax(emissions, dim=-1)
+            emission = emissions[0]  # (T, vocab)
+            sec_per_frame = chunk_dur / emission.shape[0]
 
             targets = torch.tensor([tokens], device=self.device, dtype=torch.int32)
 
@@ -195,8 +231,9 @@ class Wav2Vec2Aligner:
                 )
             except RuntimeError as e:
                 print(f"[Wav2Vec2Aligner] chunk {chunk_idx} forced_align failed: {e}", flush=True)
-                for _, words_idx, _ in word_char_counts:
-                    aligned[words_idx] = words[words_idx]
+                # Leave the words unmarked: those in the overlap region get a
+                # second chance in the next chunk; the rest fall back to their
+                # original timing in the final sweep below.
                 chunk_start_sec += chunk_step
                 chunk_idx += 1
                 continue
@@ -211,14 +248,14 @@ class Wav2Vec2Aligner:
             # token_spans count should equal len(targets). If forced_align skipped
             # some chars (rare), fall back to original timing for affected words.
             if len(token_spans) != len(tokens):
-                # Sanity check — log + skip chunk to avoid wrong alignments
+                # Sanity check — log + skip chunk to avoid wrong alignments.
+                # Unmarked words are retried by the next chunk or swept to
+                # original timing at the end.
                 print(
                     f"[Wav2Vec2Aligner] chunk {chunk_idx}: token_spans={len(token_spans)} "
                     f"vs targets={len(tokens)} — sequences out of sync, falling back",
                     flush=True,
                 )
-                for _, words_idx, _ in word_char_counts:
-                    aligned[words_idx] = words[words_idx]
                 chunk_start_sec += chunk_step
                 chunk_idx += 1
                 continue
@@ -233,6 +270,11 @@ class Wav2Vec2Aligner:
             for n_chars, words_idx, word_text in word_char_counts:
                 spans_for_word = token_spans[cursor:cursor + n_chars]
                 cursor += n_chars
+                if words_idx not in writable:
+                    # Anchor word — its timing was already written by an earlier
+                    # chunk (or is deferred to the next); the spans only served
+                    # to absorb its speech in the CTC path.
+                    continue
                 if not spans_for_word:
                     aligned[words_idx] = words[words_idx]
                     continue

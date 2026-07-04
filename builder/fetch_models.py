@@ -1,11 +1,18 @@
 from faster_whisper.utils import download_model
 
 # ── Whisper Models ──────────────────────────────────────────────────
-# Pre-download models used in production.
-# Other models in AVAILABLE_MODELS (predict.py) download on first request.
+# Pre-download every model production actually requests.
+# Other models in AVAILABLE_MODELS (predict.py) download on first request —
+# do NOT let a model land in a production code path without adding it here:
+# a request-time download makes that path depend on HuggingFace availability
+# and adds 30-60s cold latency. `medium` is the web2labs fallback model,
+# which fires exactly when a job already failed once — the worst possible
+# moment to be downloading from the network.
 whisper_models = [
-    "large-v3",
-    "turbo",
+    "large-v3",  # web2labs primary transcription model (transcribeStream)
+    "medium",    # web2labs fallback + tools QUALITY_PRESET + static transcribe()
+    "small",     # tools FAST_PRESET (tools.whisper.service.ts)
+    "turbo",     # RunPod hub CI test (.runpod/tests.json)
 ]
 
 for model_name in whisper_models:
