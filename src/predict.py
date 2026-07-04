@@ -73,6 +73,51 @@ class Predictor:
         """No models are pre-loaded. Setup is minimal."""
         pass
 
+    def _load_model_locked(self, model_name):
+        """
+        Load a Whisper model, keeping every previously loaded model RESIDENT
+        (multi-model residency, 2026-07-04). Must be called holding
+        self.model_lock.
+
+        The original template unloaded the current model whenever a different
+        one was requested — sized for GPUs that fit one model. This endpoint's
+        pool is 24/48GB cards and the full production set (large-v3 + medium +
+        small + turbo ≈ 6.7GB fp16) fits alongside CLAP + wav2vec2 (~2GB) with
+        headroom. Unload-on-switch meant one tools request (model=small)
+        landing between Studio chunks (large-v3) forced a 5-15s large-v3
+        reload onto the next chunk — pure churn on the chunk loop's critical
+        path, and the medium fallback paid the same penalty.
+
+        If a load fails, evict the least-recently-used resident model and
+        retry (the realistic failure on a healthy worker is VRAM pressure;
+        sniffing CUDA-OOM message strings across ctranslate2 versions is
+        brittle, and the cost of a pointless evict is one later reload).
+        Raises only once nothing is left to evict.
+        """
+        while True:
+            try:
+                print(f"Loading model: {model_name} (resident: {list(self.models)})...")
+                loaded_model = WhisperModel(
+                    model_name,
+                    device="cuda" if rp_cuda.is_available() else "cpu",
+                    compute_type="float16" if rp_cuda.is_available() else "int8",
+                )
+                self.models[model_name] = loaded_model
+                print(f"Model {model_name} loaded successfully.")
+                return loaded_model
+            except Exception as e:
+                if self.models:
+                    evicted = next(iter(self.models))
+                    del self.models[evicted]
+                    gc.collect()
+                    print(
+                        f"Model {model_name} failed to load ({e}) — evicted LRU "
+                        f"model {evicted}, retrying..."
+                    )
+                    continue
+                print(f"Error loading model {model_name}: {e}")
+                raise ValueError(f"Failed to load model {model_name}: {e}") from e
+
     def predict(
         self,
         audio,
@@ -110,148 +155,143 @@ class Predictor:
             )
 
         with self.model_lock:
-            model = None
-            if model_name not in self.models:
-                # Unload existing model if necessary
-                if self.models:
-                    existing_model_name = list(self.models.keys())[0]
-                    print(f"Unloading model: {existing_model_name}...")
-                    # Remove reference and clear dict
-                    del self.models[existing_model_name]
-                    self.models.clear()
-                    # Hint Python to release memory
-                    gc.collect()
-                    if rp_cuda.is_available():
-                        # If using PyTorch models, you might call torch.cuda.empty_cache()
-                        # FasterWhisper uses CTranslate2; explicit cache clearing might not be needed
-                        # but gc.collect() is generally helpful.
-                        pass
-                    print(f"Model {existing_model_name} unloaded.")
-
-                # Load the requested model
-                print(f"Loading model: {model_name}...")
-                try:
-                    loaded_model = WhisperModel(
-                        model_name,
-                        device="cuda" if rp_cuda.is_available() else "cpu",
-                        compute_type="float16" if rp_cuda.is_available() else "int8",
-                    )
-                    self.models[model_name] = loaded_model
-                    model = loaded_model
-                    print(f"Model {model_name} loaded successfully.")
-                except Exception as e:
-                    print(f"Error loading model {model_name}: {e}")
-                    raise ValueError(f"Failed to load model {model_name}: {e}") from e
-            else:
-                # Model already loaded
-                model = self.models[model_name]
+            model = self.models.get(model_name)
+            if model is not None:
+                # Re-insert so dict order doubles as LRU order (oldest first).
+                self.models.pop(model_name)
+                self.models[model_name] = model
                 print(f"Using already loaded model: {model_name}")
-
-            # Ensure model is loaded before proceeding
-            if model is None:
-                raise RuntimeError(
-                    f"Model {model_name} could not be loaded or retrieved."
-                )
+            else:
+                model = self._load_model_locked(model_name)
 
         # Model is now loaded and ready, proceed with prediction (outside the lock?)
         # Consider if transcribe is thread-safe or if it should also be within the lock
         # For now, keeping transcribe outside as it's CPU/GPU bound work
 
-        if temperature_increment_on_fallback is not None:
-            temperature = tuple(
-                np.arange(temperature, 1.0 + 1e-6, temperature_increment_on_fallback)
-            )
-        else:
-            temperature = [temperature]
-
-        # Note: FasterWhisper's transcribe might release the GIL, potentially allowing
-        # other threads to acquire the model_lock if transcribe is lengthy.
-        # If issues arise, the lock might need to encompass the transcribe call too.
-        segments_generator, info = model.transcribe(
-            str(audio),
-            language=language,
-            task="transcribe",
-            beam_size=beam_size,
-            best_of=best_of,
-            patience=patience,
-            length_penalty=length_penalty,
-            temperature=temperature,
-            compression_ratio_threshold=compression_ratio_threshold,
-            log_prob_threshold=logprob_threshold,
-            no_speech_threshold=no_speech_threshold,
-            condition_on_previous_text=condition_on_previous_text,
-            initial_prompt=initial_prompt,
-            prefix=None,
-            suppress_blank=True,
-            suppress_tokens=parse_suppress_tokens(suppress_tokens),
-            without_timestamps=False,
-            max_initial_timestamp=1.0,
-            word_timestamps=word_timestamps,
-            vad_filter=enable_vad,
-        )
-
-        segments = list(segments_generator)
-
-        # Format transcription
-        transcription_output = format_segments(transcription, segments)
-
-        # Handle translation if requested
-        translation_output = None
-        if translate:
-            translation_segments, _ = model.transcribe(
-                str(audio),
-                task="translate",
-                temperature=temperature,  # Reuse temperature settings for translation
-            )
-            translation_output = format_segments(
-                translation, list(translation_segments)
-            )
-
-        results = {
-            "segments": serialize_segments(segments),
-            "detected_language": info.language,
-            "transcription": transcription_output,
-            "translation": translation_output,
-            "device": "cuda" if rp_cuda.is_available() else "cpu",
-            "model": model_name,
-        }
-
-        if word_timestamps:
-            word_timestamps_list = []
-            for segment in segments:
-                # segment.words can be None for a no-speech segment depending on
-                # the faster-whisper version — guard instead of crashing the job.
-                for word in (segment.words or []):
-                    word_entry = {
-                        "word": word.word,
-                        "start": word.start,
-                        "end": word.end,
-                        "probability": word.probability,
-                    }
-                    word_timestamps_list.append(word_entry)
-            results["word_timestamps"] = word_timestamps_list
-
-            # Wav2vec2 forced alignment — re-times each word against actual audio
-            # (sub-50ms accuracy vs Whisper's 100-300ms cross-attention timing).
-            # Only runs if explicitly requested via force_align: true input.
-            if force_align and word_timestamps_list:
-                print(
-                    f"[Predictor] Running wav2vec2 forced alignment on "
-                    f"{len(word_timestamps_list)} words..."
-                )
-                device = "cuda" if rp_cuda.is_available() else "cpu"
-                self.aligner.setup(device=device)
-                aligned_list = self.aligner.align(str(audio), word_timestamps_list)
-                # Replace the original timestamps with the aligned ones.
-                # The original (cross-attention) timing is gone — if you want both,
-                # this is where to add a `word_timestamps_original` field.
-                results["word_timestamps"] = aligned_list
-                results["word_timestamps_aligned"] = True  # flag so callers know
-
-        # CLAP audio-text similarity scoring (optional — only if queries provided)
+        # CLAP scoring runs CONCURRENTLY with transcription (2026-07-04). It
+        # needs only the audio file + queries — nothing from Whisper. Its
+        # CPU-heavy half (librosa 48kHz decode + mel featurization of ~120
+        # windows) overlaps Whisper's GPU decode, and the GPU halves interleave
+        # on separate streams; run serially it added ~5s per 2-minute chunk.
+        # score() catches all exceptions and returns None (fail-soft), so the
+        # thread itself can never raise.
+        clap_thread = None
+        clap_result_holder = {}
         if clap_queries and isinstance(clap_queries, dict) and len(clap_queries) > 0:
-            print(f"[AudioSpecialist] Running CLAP scoring with {len(clap_queries)} queries...")
-            clap_result = self.clap_scorer.score(str(audio), clap_queries)
+            print(
+                f"[AudioSpecialist] Starting CLAP scoring ({len(clap_queries)} queries) "
+                f"concurrent with transcription..."
+            )
+
+            def run_clap_scoring():
+                clap_result_holder["result"] = self.clap_scorer.score(str(audio), clap_queries)
+
+            clap_thread = threading.Thread(
+                target=run_clap_scoring, name="clap-scorer", daemon=True
+            )
+            clap_thread.start()
+
+        try:
+            if temperature_increment_on_fallback is not None:
+                temperature = tuple(
+                    np.arange(temperature, 1.0 + 1e-6, temperature_increment_on_fallback)
+                )
+            else:
+                temperature = [temperature]
+
+            # Note: FasterWhisper's transcribe might release the GIL, potentially allowing
+            # other threads to acquire the model_lock if transcribe is lengthy.
+            # If issues arise, the lock might need to encompass the transcribe call too.
+            segments_generator, info = model.transcribe(
+                str(audio),
+                language=language,
+                task="transcribe",
+                beam_size=beam_size,
+                best_of=best_of,
+                patience=patience,
+                length_penalty=length_penalty,
+                temperature=temperature,
+                compression_ratio_threshold=compression_ratio_threshold,
+                log_prob_threshold=logprob_threshold,
+                no_speech_threshold=no_speech_threshold,
+                condition_on_previous_text=condition_on_previous_text,
+                initial_prompt=initial_prompt,
+                prefix=None,
+                suppress_blank=True,
+                suppress_tokens=parse_suppress_tokens(suppress_tokens),
+                without_timestamps=False,
+                max_initial_timestamp=1.0,
+                word_timestamps=word_timestamps,
+                vad_filter=enable_vad,
+            )
+
+            segments = list(segments_generator)
+
+            # Format transcription
+            transcription_output = format_segments(transcription, segments)
+
+            # Handle translation if requested
+            translation_output = None
+            if translate:
+                translation_segments, _ = model.transcribe(
+                    str(audio),
+                    task="translate",
+                    temperature=temperature,  # Reuse temperature settings for translation
+                )
+                translation_output = format_segments(
+                    translation, list(translation_segments)
+                )
+
+            results = {
+                "segments": serialize_segments(segments),
+                "detected_language": info.language,
+                "transcription": transcription_output,
+                "translation": translation_output,
+                "device": "cuda" if rp_cuda.is_available() else "cpu",
+                "model": model_name,
+            }
+
+            if word_timestamps:
+                word_timestamps_list = []
+                for segment in segments:
+                    # segment.words can be None for a no-speech segment depending on
+                    # the faster-whisper version — guard instead of crashing the job.
+                    for word in (segment.words or []):
+                        word_entry = {
+                            "word": word.word,
+                            "start": word.start,
+                            "end": word.end,
+                            "probability": word.probability,
+                        }
+                        word_timestamps_list.append(word_entry)
+                results["word_timestamps"] = word_timestamps_list
+
+                # Wav2vec2 forced alignment — re-times each word against actual audio
+                # (sub-50ms accuracy vs Whisper's 100-300ms cross-attention timing).
+                # Only runs if explicitly requested via force_align: true input.
+                if force_align and word_timestamps_list:
+                    print(
+                        f"[Predictor] Running wav2vec2 forced alignment on "
+                        f"{len(word_timestamps_list)} words..."
+                    )
+                    device = "cuda" if rp_cuda.is_available() else "cpu"
+                    self.aligner.setup(device=device)
+                    aligned_list = self.aligner.align(str(audio), word_timestamps_list)
+                    # Replace the original timestamps with the aligned ones.
+                    # The original (cross-attention) timing is gone — if you want both,
+                    # this is where to add a `word_timestamps_original` field.
+                    results["word_timestamps"] = aligned_list
+                    results["word_timestamps_aligned"] = True  # flag so callers know
+        finally:
+            # The CLAP thread reads the audio file and holds the scorer lock —
+            # never let it outlive this job. Without this join on the exception
+            # path it would race the handler's file cleanup and block the next
+            # job's CLAP until it finished.
+            if clap_thread is not None:
+                clap_thread.join()
+
+        if clap_thread is not None:
+            clap_result = clap_result_holder.get("result")
             if clap_result:
                 results["clap_scores"] = clap_result
                 print(f"[AudioSpecialist] CLAP scoring complete: {clap_result['duration']}s, device={clap_result['device']}")

@@ -10,7 +10,9 @@ One upload, two signals: transcript + audio understanding. v2.
 2. **Wav2vec2 forced alignment** (optional, `force_align: true`) — re-times each word against the actual audio waveform (~30-50ms accuracy vs Whisper's ~100-300ms) and adds NP-SBV2 silence-run boundaries (`onset_start` / `offset_end`) for cut-friendly timing
 3. **CLAP** (optional) — Scores audio against natural language queries ("loud explosions", "excited reactions", "dramatic music") and returns per-second relevance scores
 
-All models run on the same GPU, sharing the audio file. CLAP adds ~5s per 2-minute chunk; forced alignment adds ~30-50% of the Whisper wall time.
+All models run on the same GPU, sharing the audio file. CLAP runs **concurrently with transcription** (near-zero wall-time overhead; serially it added ~5s per 2-minute chunk); forced alignment adds ~30-50% of the Whisper wall time.
+
+Whisper models stay **resident** once loaded (multi-model residency): a request for `small` no longer evicts `large-v3`, so mixed traffic (Studio chunks + tools presets + the `medium` fallback) causes no model-reload churn. The full production set fits in ~9GB alongside CLAP + wav2vec2; on VRAM pressure the least-recently-used model is evicted and the load retried.
 
 ## Models
 
